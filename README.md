@@ -1,2 +1,0 @@
-# vcearn-bot
-y bot 
