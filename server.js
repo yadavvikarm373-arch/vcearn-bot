@@ -16,7 +16,7 @@ try {
     process.env.FIREBASE_SERVICE_ACCOUNT
   );
 } catch(e) {
-  console.error('Firebase JSON parse error:', e);
+  console.error('Firebase JSON error:', e);
 }
 
 if (!admin.apps.length) {
@@ -74,7 +74,9 @@ async function handleMessage(msg) {
   const text = msg.text;
 
   if (chatId !== ADMIN_CHAT_ID) {
-    await sendTelegram(chatId, '❌ Unauthorized!');
+    await sendTelegram(
+      chatId, '❌ Unauthorized!'
+    );
     return;
   }
 
@@ -97,62 +99,99 @@ async function handleMessage(msg) {
     await showUsers(chatId);
   }
   else if (text.startsWith('/txn_')) {
-    // Format: /txn_WITHDRAWALID_TXNID
-    const parts = text.replace('/txn_','').split('_');
-    const wId = parts[0];
-    const txnId = parts.slice(1).join('_');
+    const content = text.replace('/txn_', '');
+    const underscoreIndex = content.indexOf('_');
+    if (underscoreIndex === -1) {
+      await sendTelegram(chatId,
+        '❌ Format: /txn_WITHDRAWALID_TXNID'
+      );
+      return;
+    }
+    const wId = content.substring(
+      0, underscoreIndex
+    );
+    const txnId = content.substring(
+      underscoreIndex + 1
+    );
     await approveUPI(chatId, wId, txnId);
   }
   else if (text.startsWith('/code_')) {
-    // Format: /code_WITHDRAWALID_GIFTCODE
-    const parts = text.replace('/code_','').split('_');
-    const wId = parts[0];
-    const code = parts.slice(1).join('_');
+    const content = text.replace('/code_', '');
+    const underscoreIndex = content.indexOf('_');
+    if (underscoreIndex === -1) {
+      await sendTelegram(chatId,
+        '❌ Format: /code_WITHDRAWALID_CODE'
+      );
+      return;
+    }
+    const wId = content.substring(
+      0, underscoreIndex
+    );
+    const code = content.substring(
+      underscoreIndex + 1
+    );
     await sendGiftCode(chatId, wId, code);
+  }
+  else {
+    await sendTelegram(chatId,
+      '❓ Unknown command\n\n' +
+      'Available:\n' +
+      '/pending\n/stats\n/users'
+    );
   }
 }
 
 // Show pending withdrawals
 async function showPending(chatId) {
   try {
+    await sendTelegram(
+      chatId, '⏳ Fetching pending...'
+    );
+
     const snap = await db
       .collection('withdrawals')
-      .where('status', '==', 'Pending')
       .get();
 
-    if (snap.empty) {
+    const pendingDocs = snap.docs.filter(
+      doc => doc.data().status === 'Pending'
+    );
+
+    if (pendingDocs.length === 0) {
       await sendTelegram(chatId,
         '✅ No pending withdrawals!'
       );
       return;
     }
 
-    for (const doc of snap.docs) {
+    await sendTelegram(chatId,
+      `📋 Found ${pendingDocs.length} pending`
+    );
+
+    for (const doc of pendingDocs) {
       const w = doc.data();
       const msg =
         `🔔 <b>Withdrawal Request</b>\n\n` +
         `👤 Name: ${w.userName || 'N/A'}\n` +
-        `💰 Amount: ₹${w.amount}\n` +
-        `📋 Method: ${w.method}\n` +
+        `💰 Amount: ₹${w.amount || 0}\n` +
+        `📋 Method: ${w.method || 'N/A'}\n` +
         `💳 UPI: ${w.upiId || 'Gift Card'}\n` +
         `🆔 ID: <code>${doc.id}</code>\n\n` +
-        `To approve UPI:\n` +
+        `<b>To approve UPI payment:</b>\n` +
         `/txn_${doc.id}_TXNID123\n\n` +
-        `To send gift code:\n` +
-        `/code_${doc.id}_GIFTCODE`;
+        `<b>To send gift card code:</b>\n` +
+        `/code_${doc.id}_GIFTCODE\n`;
 
-      const keyboard = [[
-        {
-          text: '❌ Reject',
-          callback_data: `reject_${doc.id}`
-        }
-      ]];
+      const keyboard = [[{
+        text: '❌ Reject & Refund',
+        callback_data: `reject_${doc.id}`
+      }]];
 
       await sendTelegram(chatId, msg, keyboard);
     }
   } catch(e) {
-    await sendTelegram(
-      chatId, `❌ Error: ${e.message}`
+    console.error('Pending error:', e);
+    await sendTelegram(chatId,
+      `❌ Error: ${e.message}`
     );
   }
 }
@@ -160,29 +199,45 @@ async function showPending(chatId) {
 // Show stats
 async function showStats(chatId) {
   try {
+    await sendTelegram(
+      chatId, '⏳ Fetching stats...'
+    );
+
     const usersSnap = await db
       .collection('users')
       .get();
-    
-    const pendingSnap = await db
+
+    const withdrawalsSnap = await db
       .collection('withdrawals')
-      .where('status', '==', 'Pending')
       .get();
-    
-    const completedSnap = await db
-      .collection('withdrawals')
-      .where('status', '==', 'Complete')
-      .get();
+
+    let pending = 0;
+    let completed = 0;
+    let rejected = 0;
+    let totalAmount = 0;
+
+    withdrawalsSnap.forEach(doc => {
+      const data = doc.data();
+      if (data.status === 'Pending') pending++;
+      if (data.status === 'Complete') {
+        completed++;
+        totalAmount += (data.amount || 0);
+      }
+      if (data.status === 'Rejected') rejected++;
+    });
 
     await sendTelegram(chatId,
       `📊 <b>VCEarn Stats</b>\n\n` +
       `👥 Total Users: ${usersSnap.size}\n` +
-      `⏳ Pending: ${pendingSnap.size}\n` +
-      `✅ Completed: ${completedSnap.size}`
+      `⏳ Pending: ${pending}\n` +
+      `✅ Completed: ${completed}\n` +
+      `❌ Rejected: ${rejected}\n` +
+      `💰 Total Paid: ₹${totalAmount}`
     );
   } catch(e) {
-    await sendTelegram(
-      chatId, `❌ Error: ${e.message}`
+    console.error('Stats error:', e);
+    await sendTelegram(chatId,
+      `❌ Error: ${e.message}`
     );
   }
 }
@@ -190,17 +245,22 @@ async function showStats(chatId) {
 // Show users
 async function showUsers(chatId) {
   try {
+    await sendTelegram(
+      chatId, '⏳ Fetching users...'
+    );
+
     const snap = await db
       .collection('users')
       .get();
-    
+
     await sendTelegram(chatId,
-      `👥 <b>Total Users: ${snap.size}</b>\n\n` +
-      `Active accounts in VCEarn`
+      `👥 <b>VCEarn Users</b>\n\n` +
+      `Total: ${snap.size} users`
     );
   } catch(e) {
-    await sendTelegram(
-      chatId, `❌ Error: ${e.message}`
+    console.error('Users error:', e);
+    await sendTelegram(chatId,
+      `❌ Error: ${e.message}`
     );
   }
 }
@@ -223,17 +283,23 @@ async function approveUPI(
   chatId, withdrawalId, txnId
 ) {
   try {
+    await sendTelegram(
+      chatId, '⏳ Processing approval...'
+    );
+
     const docRef = db
       .collection('withdrawals')
       .doc(withdrawalId);
+
     const doc = await docRef.get();
-    
+
     if (!doc.exists) {
-      await sendTelegram(
-        chatId, '❌ Not found!'
+      await sendTelegram(chatId,
+        `❌ Withdrawal not found!\nID: ${withdrawalId}`
       );
       return;
     }
+
     const w = doc.data();
 
     await docRef.update({
@@ -244,23 +310,30 @@ async function approveUPI(
           .serverTimestamp()
     });
 
-    await db.collection('users')
-      .doc(w.userId)
-      .update({
-        totalWithdrawn:
-          admin.firestore.FieldValue
-            .increment(w.amount)
-      });
+    try {
+      await db
+        .collection('users')
+        .doc(w.userId)
+        .update({
+          totalWithdrawn:
+            admin.firestore.FieldValue
+              .increment(w.amount || 0)
+        });
+    } catch(e) {
+      console.error('User update error:', e);
+    }
 
     await sendTelegram(chatId,
-      `✅ <b>Approved!</b>\n` +
+      `✅ <b>Payment Approved!</b>\n\n` +
       `👤 ${w.userName || 'User'}\n` +
       `💰 ₹${w.amount}\n` +
-      `🔖 TXN: ${txnId}`
+      `💳 UPI: ${w.upiId}\n` +
+      `🔖 TXN ID: ${txnId}`
     );
   } catch(e) {
-    await sendTelegram(
-      chatId, `❌ Error: ${e.message}`
+    console.error('Approve error:', e);
+    await sendTelegram(chatId,
+      `❌ Error: ${e.message}`
     );
   }
 }
@@ -270,17 +343,23 @@ async function sendGiftCode(
   chatId, withdrawalId, code
 ) {
   try {
+    await sendTelegram(
+      chatId, '⏳ Sending gift code...'
+    );
+
     const docRef = db
       .collection('withdrawals')
       .doc(withdrawalId);
+
     const doc = await docRef.get();
-    
+
     if (!doc.exists) {
-      await sendTelegram(
-        chatId, '❌ Not found!'
+      await sendTelegram(chatId,
+        `❌ Withdrawal not found!\nID: ${withdrawalId}`
       );
       return;
     }
+
     const w = doc.data();
 
     await docRef.update({
@@ -291,23 +370,30 @@ async function sendGiftCode(
           .serverTimestamp()
     });
 
-    await db.collection('users')
-      .doc(w.userId)
-      .update({
-        totalWithdrawn:
-          admin.firestore.FieldValue
-            .increment(w.amount)
-      });
+    try {
+      await db
+        .collection('users')
+        .doc(w.userId)
+        .update({
+          totalWithdrawn:
+            admin.firestore.FieldValue
+              .increment(w.amount || 0)
+        });
+    } catch(e) {
+      console.error('User update error:', e);
+    }
 
     await sendTelegram(chatId,
-      `✅ <b>Gift Code Sent!</b>\n` +
+      `✅ <b>Gift Code Sent!</b>\n\n` +
       `👤 ${w.userName || 'User'}\n` +
       `💰 ₹${w.amount}\n` +
-      `🎁 Code: ${code}`
+      `📋 Method: ${w.method}\n` +
+      `🎁 Code: <code>${code}</code>`
     );
   } catch(e) {
-    await sendTelegram(
-      chatId, `❌ Error: ${e.message}`
+    console.error('Gift error:', e);
+    await sendTelegram(chatId,
+      `❌ Error: ${e.message}`
     );
   }
 }
@@ -317,30 +403,29 @@ async function rejectWithdrawal(
   chatId, withdrawalId
 ) {
   try {
+    await sendTelegram(
+      chatId, '⏳ Processing rejection...'
+    );
+
     const docRef = db
       .collection('withdrawals')
       .doc(withdrawalId);
+
     const doc = await docRef.get();
-    
+
     if (!doc.exists) {
-      await sendTelegram(
-        chatId, '❌ Not found!'
+      await sendTelegram(chatId,
+        `❌ Not found!\nID: ${withdrawalId}`
       );
       return;
     }
+
     const w = doc.data();
 
     const refundTokens =
       w.amount === 20 ? 200 :
-      w.amount === 50 ? 500 : 1000;
-
-    await db.collection('users')
-      .doc(w.userId)
-      .update({
-        tokens:
-          admin.firestore.FieldValue
-            .increment(refundTokens)
-      });
+      w.amount === 50 ? 500 :
+      w.amount === 100 ? 1000 : 200;
 
     await docRef.update({
       status: 'Rejected',
@@ -349,59 +434,79 @@ async function rejectWithdrawal(
           .serverTimestamp()
     });
 
+    try {
+      await db
+        .collection('users')
+        .doc(w.userId)
+        .update({
+          tokens:
+            admin.firestore.FieldValue
+              .increment(refundTokens)
+        });
+    } catch(e) {
+      console.error('Refund error:', e);
+    }
+
     await sendTelegram(chatId,
-      `❌ <b>Rejected!</b>\n` +
+      `❌ <b>Withdrawal Rejected!</b>\n\n` +
       `👤 ${w.userName || 'User'}\n` +
-      `💰 ₹${w.amount} tokens refunded`
+      `💰 ₹${w.amount} rejected\n` +
+      `🪙 ${refundTokens} tokens refunded`
     );
   } catch(e) {
-    await sendTelegram(
-      chatId, `❌ Error: ${e.message}`
+    console.error('Reject error:', e);
+    await sendTelegram(chatId,
+      `❌ Error: ${e.message}`
     );
   }
 }
 
-// Notify withdrawal from app
+// Notify from app
 app.post('/notify-withdrawal',
   async (req, res) => {
     try {
       const {
-        userName, amount, method,
-        upiId, withdrawalId
+        userName,
+        amount,
+        method,
+        upiId,
+        withdrawalId
       } = req.body;
 
       const msg =
-        `🔔 <b>NEW WITHDRAWAL!</b>\n\n` +
-        `👤 ${userName}\n` +
+        `🔔 <b>NEW WITHDRAWAL REQUEST!</b>\n\n` +
+        `👤 ${userName || 'User'}\n` +
         `💰 ₹${amount}\n` +
         `📋 ${method}\n` +
         `💳 ${upiId || 'Gift Card'}\n` +
         `🆔 <code>${withdrawalId}</code>\n\n` +
-        `To approve UPI:\n` +
+        `<b>To approve UPI:</b>\n` +
         `/txn_${withdrawalId}_TXNID\n\n` +
-        `To send gift:\n` +
+        `<b>To send gift:</b>\n` +
         `/code_${withdrawalId}_CODE`;
 
       const keyboard = [[{
-        text: '❌ Reject',
+        text: '❌ Reject & Refund',
         callback_data: `reject_${withdrawalId}`
       }]];
 
       await sendTelegram(
         ADMIN_CHAT_ID, msg, keyboard
       );
+
       res.json({ ok: true });
     } catch(e) {
-      console.error(e.message);
-      res.json({ ok: false });
+      console.error('Notify error:', e);
+      res.json({ ok: false, error: e.message });
     }
   }
 );
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'VCEarn Bot Running ✅' 
+  res.json({
+    status: '✅ VCEarn Bot Running',
+    time: new Date().toISOString()
   });
 });
 
