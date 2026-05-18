@@ -28,7 +28,7 @@ if (!admin.apps.length) {
 
 const db = admin.database();
 
-// Pending TXN/Code input state
+// Pending TXN/Code input state 
 const waitingForInput = {};
 
 async function sendTelegram(chatId, message, keyboard = null) {
