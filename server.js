@@ -11,12 +11,17 @@ const BOT_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const DB_URL = 'https://vcearn1-default-rtdb.asia-southeast1.firebasedatabase.app';
 
 let serviceAccount;
+
 try {
   serviceAccount = JSON.parse(
     process.env.FIREBASE_SERVICE_ACCOUNT
   );
-} catch(e) {
-  console.error('JSON error:', e.message);
+
+  serviceAccount.private_key =
+    serviceAccount.private_key.replace(/\\n/g, '\n');
+
+} catch (e) {
+  console.error('Firebase JSON Error:', e);
 }
 
 if (!admin.apps.length) {
@@ -28,8 +33,15 @@ if (!admin.apps.length) {
 
 const db = admin.database();
 
-// Pending TXN/Code input state
 const waitingForInput = {};
+
+function escapeHtml(text = '') {
+  return text
+    .toString()
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 async function sendTelegram(chatId, message, keyboard = null) {
   try {
@@ -38,430 +50,689 @@ async function sendTelegram(chatId, message, keyboard = null) {
       text: message,
       parse_mode: 'HTML'
     };
+
     if (keyboard) {
       data.reply_markup = {
         inline_keyboard: keyboard
       };
     }
+
     await axios.post(`${BOT_URL}/sendMessage`, data);
-  } catch(e) {
-    console.error('Send error:', e.message);
+
+  } catch (e) {
+    console.error('Telegram Send Error:', e.message);
   }
+}
+
+async function removeButtons(chatId, messageId) {
+  try {
+    await axios.post(`${BOT_URL}/editMessageReplyMarkup`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: {
+        inline_keyboard: []
+      }
+    });
+  } catch (e) {}
 }
 
 app.post('/webhook', async (req, res) => {
   res.json({ ok: true });
+
   const update = req.body;
+
   try {
+
     if (update.callback_query) {
       await handleCallback(update.callback_query);
-    } else if (update.message?.text) {
+    }
+
+    else if (update.message?.text) {
       await handleMessage(update.message);
     }
-  } catch(e) {
-    console.error('Webhook error:', e.message);
+
+  } catch (e) {
+    console.error('Webhook Error:', e);
   }
 });
 
 async function handleMessage(msg) {
+
   const chatId = msg.chat.id.toString();
-  const text = msg.text;
+  const text = msg.text.trim();
 
   if (chatId !== ADMIN_CHAT_ID) {
-    await sendTelegram(chatId, '❌ Unauthorized!');
+    await sendTelegram(chatId, '❌ Unauthorized');
     return;
   }
 
-  // Check if waiting for TXN ID input
+  // WAITING INPUT
   if (waitingForInput[chatId]) {
-    const { type, withdrawalId } = waitingForInput[chatId];
+
+    const state = waitingForInput[chatId];
+
     delete waitingForInput[chatId];
 
-    if (type === 'txn') {
-      await approveUPI(chatId, withdrawalId, text.trim());
-    } else if (type === 'code') {
-      await sendGiftCode(chatId, withdrawalId, text.trim());
+    // TXN ID
+    if (state.type === 'txn') {
+      await approveUPI(
+        chatId,
+        state.withdrawalId,
+        text
+      );
+      return;
     }
-    return;
+
+    // GIFT CODE
+    if (state.type === 'gift_code') {
+      await approveGift(
+        chatId,
+        state.withdrawalId,
+        text
+      );
+      return;
+    }
+
+    // CUSTOM REJECTION
+    if (state.type === 'custom_reject') {
+
+      await rejectWithdrawal(
+        chatId,
+        state.withdrawalId,
+        text
+      );
+
+      return;
+    }
   }
 
+  // COMMANDS
+
   if (text === '/start') {
-    await sendTelegram(chatId,
-      '👑 <b>VCEarn Admin Bot</b>\n\n' +
-      'Commands:\n' +
-      '/pending - Pending withdrawals\n' +
-      '/stats - App statistics\n' +
-      '/users - Total users\n\n' +
-      'Use buttons to approve/reject!'
+
+    await sendTelegram(
+      chatId,
+      `👑 <b>VCEarn Admin Bot</b>
+
+Commands:
+/pending - Pending withdrawals
+/stats - App statistics
+/users - Total users`
     );
   }
+
   else if (text === '/pending') {
     await showPending(chatId);
   }
+
   else if (text === '/stats') {
     await showStats(chatId);
   }
+
   else if (text === '/users') {
     await showUsers(chatId);
   }
+
   else {
-    await sendTelegram(chatId,
-      '❓ Unknown command\nUse /start for help'
+    await sendTelegram(
+      chatId,
+      '❓ Unknown command'
     );
   }
 }
 
 async function showPending(chatId) {
+
   try {
-    await sendTelegram(chatId, '⏳ Fetching pending...');
+
+    await sendTelegram(
+      chatId,
+      '⏳ Fetching pending withdrawals...'
+    );
 
     const snap = await db.ref('withdrawals').once('value');
 
     if (!snap.exists()) {
-      await sendTelegram(chatId, '✅ No withdrawals yet!');
+      await sendTelegram(chatId, '✅ No withdrawals');
       return;
     }
 
     const pending = [];
+
     snap.forEach(child => {
+
       const w = child.val();
+
       if (w.status === 'Pending') {
-        pending.push({ id: child.key, ...w });
+
+        pending.push({
+          withdrawalId: child.key,
+          ...w
+        });
       }
     });
 
     if (pending.length === 0) {
-      await sendTelegram(chatId, '✅ No pending withdrawals!');
+      await sendTelegram(chatId, '✅ No pending withdrawals');
       return;
     }
 
-    await sendTelegram(chatId, `📋 Found <b>${pending.length}</b> pending`);
+    await sendTelegram(
+      chatId,
+      `📋 Found ${pending.length} pending withdrawals`
+    );
 
     for (const w of pending) {
-      const isUPI = w.method === 'UPI';
-      const isGift = w.method === 'Amazon' || w.method === 'Playstore';
+
+      const method = w.method || '';
 
       const msg =
-        `🔔 <b>Withdrawal Request</b>\n\n` +
-        `👤 Name: ${w.userName || 'N/A'}\n` +
-        `💰 Amount: ₹${w.amount}\n` +
-        `📋 Method: ${w.method}\n` +
-        `💳 ${isUPI ? 'UPI: ' + w.upiId : 'Gift Card'}\n` +
-        `🆔 ID: <code>${w.id}</code>`;
+`🔔 <b>Withdrawal Request</b>
 
-      // Build keyboard with all buttons
+👤 Name: ${escapeHtml(w.userName || 'User')}
+💰 Amount: ₹${w.amount}
+📋 Method: ${escapeHtml(method)}
+💳 ${method === 'UPI' ? escapeHtml(w.upiId || 'N/A') : 'Gift Card'}
+
+🆔 ID:
+<code>${w.withdrawalId}</code>`;
+
       const keyboard = [];
 
-      if (isUPI) {
+      // UPI
+      if (method === 'UPI') {
+
         keyboard.push([{
-          text: '✅ Approve UPI Payment',
-          callback_data: `approve_upi_${w.id}`
+          text: '✅ Approve UPI',
+          callback_data: `approve_upi_${w.withdrawalId}`
         }]);
       }
 
-      if (isGift) {
+      // AMAZON
+      else if (method === 'Amazon') {
+
         keyboard.push([{
-          text: '🎁 Send Gift Card Code',
-          callback_data: `approve_gift_${w.id}`
+          text: '🎁 Send Amazon Code',
+          callback_data: `approve_gift_${w.withdrawalId}`
         }]);
       }
 
-      if (!isUPI && !isGift) {
+      // PLAYSTORE
+      else if (method === 'Playstore') {
+
         keyboard.push([{
-          text: '✅ Approve',
-          callback_data: `approve_upi_${w.id}`
-        }]);
-        keyboard.push([{
-          text: '🎁 Send Gift Code',
-          callback_data: `approve_gift_${w.id}`
+          text: '🎮 Send Playstore Code',
+          callback_data: `approve_gift_${w.withdrawalId}`
         }]);
       }
 
       keyboard.push([{
-        text: '❌ Reject & Refund Tokens',
-        callback_data: `reject_${w.id}`
+        text: '❌ Reject & Refund',
+        callback_data: `reject_${w.withdrawalId}`
       }]);
 
-      await sendTelegram(chatId, msg, keyboard);
+      await sendTelegram(
+        chatId,
+        msg,
+        keyboard
+      );
     }
-  } catch(e) {
-    console.error('Pending error:', e);
-    await sendTelegram(chatId, `❌ Error: ${e.message}`);
+
+  } catch (e) {
+
+    console.error(e);
+
+    await sendTelegram(
+      chatId,
+      `❌ Error: ${e.message}`
+    );
   }
 }
 
 async function showStats(chatId) {
-  try {
-    const usersSnap = await db.ref('users').once('value');
-    const withdrawalsSnap = await db.ref('withdrawals').once('value');
 
-    let pending = 0, completed = 0, rejected = 0, totalPaid = 0;
+  try {
+
+    const usersSnap =
+      await db.ref('users').once('value');
+
+    const withdrawalsSnap =
+      await db.ref('withdrawals').once('value');
+
+    let pending = 0;
+    let completed = 0;
+    let rejected = 0;
+    let totalPaid = 0;
 
     if (withdrawalsSnap.exists()) {
+
       withdrawalsSnap.forEach(child => {
+
         const w = child.val();
+
         if (w.status === 'Pending') pending++;
-        if (w.status === 'Complete') { completed++; totalPaid += (w.amount || 0); }
-        if (w.status === 'Rejected') rejected++;
+
+        if (w.status === 'Complete') {
+          completed++;
+          totalPaid += (w.amount || 0);
+        }
+
+        if (w.status === 'Rejected') {
+          rejected++;
+        }
       });
     }
 
-    const totalUsers = usersSnap.exists()
-      ? Object.keys(usersSnap.val()).length : 0;
+    const totalUsers =
+      usersSnap.exists()
+      ? Object.keys(usersSnap.val()).length
+      : 0;
 
-    await sendTelegram(chatId,
-      `📊 <b>VCEarn Stats</b>\n\n` +
-      `👥 Total Users: ${totalUsers}\n` +
-      `⏳ Pending: ${pending}\n` +
-      `✅ Completed: ${completed}\n` +
-      `❌ Rejected: ${rejected}\n` +
-      `💰 Total Paid: ₹${totalPaid}`
+    await sendTelegram(
+      chatId,
+`📊 <b>VCEarn Stats</b>
+
+👥 Users: ${totalUsers}
+⏳ Pending: ${pending}
+✅ Completed: ${completed}
+❌ Rejected: ${rejected}
+💰 Total Paid: ₹${totalPaid}`
     );
-  } catch(e) {
-    await sendTelegram(chatId, `❌ Error: ${e.message}`);
+
+  } catch (e) {
+
+    await sendTelegram(
+      chatId,
+      `❌ Error: ${e.message}`
+    );
   }
 }
 
 async function showUsers(chatId) {
+
   try {
-    const snap = await db.ref('users').once('value');
-    const count = snap.exists()
-      ? Object.keys(snap.val()).length : 0;
-    await sendTelegram(chatId,
-      `👥 <b>Total Users: ${count}</b>`
+
+    const snap =
+      await db.ref('users').once('value');
+
+    const count =
+      snap.exists()
+      ? Object.keys(snap.val()).length
+      : 0;
+
+    await sendTelegram(
+      chatId,
+      `👥 Total Users: ${count}`
     );
-  } catch(e) {
-    await sendTelegram(chatId, `❌ Error: ${e.message}`);
+
+  } catch (e) {
+
+    await sendTelegram(
+      chatId,
+      `❌ Error: ${e.message}`
+    );
   }
 }
 
 async function handleCallback(cb) {
+
   const chatId = cb.message.chat.id.toString();
   const data = cb.data;
   const msgId = cb.message.message_id;
 
   if (chatId !== ADMIN_CHAT_ID) return;
 
-  // Approve UPI - ask for TXN ID
+  // REMOVE BUTTONS
+  await removeButtons(chatId, msgId);
+
+  // APPROVE UPI
   if (data.startsWith('approve_upi_')) {
-    const wId = data.replace('approve_upi_', '');
 
-    // Verify withdrawal exists
-    const snap = await db.ref(`withdrawals/${wId}`).once('value');
-    if (!snap.exists()) {
-      await sendTelegram(chatId, '❌ Withdrawal not found!');
-      return;
-    }
-    const w = snap.val();
+    const withdrawalId =
+      data.replace('approve_upi_', '');
 
-    // Set waiting state
     waitingForInput[chatId] = {
       type: 'txn',
-      withdrawalId: wId
+      withdrawalId
     };
 
-    await sendTelegram(chatId,
-      `💳 <b>Enter TXN ID</b>\n\n` +
-      `👤 ${w.userName || 'User'}\n` +
-      `💰 ₹${w.amount}\n` +
-      `💳 UPI: ${w.upiId}\n\n` +
-      `Type the Transaction ID now:\n` +
-      `Example: <code>TXN123456789</code>`
+    await sendTelegram(
+      chatId,
+`💳 <b>Please enter TXN ID</b>
+
+Type TXN ID now:`
     );
   }
 
-  // Approve Gift - ask for code
+  // APPROVE GIFT
   else if (data.startsWith('approve_gift_')) {
-    const wId = data.replace('approve_gift_', '');
 
-    const snap = await db.ref(`withdrawals/${wId}`).once('value');
-    if (!snap.exists()) {
-      await sendTelegram(chatId, '❌ Withdrawal not found!');
-      return;
-    }
-    const w = snap.val();
+    const withdrawalId =
+      data.replace('approve_gift_', '');
 
     waitingForInput[chatId] = {
-      type: 'code',
-      withdrawalId: wId
+      type: 'gift_code',
+      withdrawalId
     };
 
-    await sendTelegram(chatId,
-      `🎁 <b>Enter Gift Card Code</b>\n\n` +
-      `👤 ${w.userName || 'User'}\n` +
-      `💰 ₹${w.amount}\n` +
-      `📋 Method: ${w.method}\n\n` +
-      `Type the gift card code now:\n` +
-      `Example: <code>AMZN-1234-5678-9012</code>`
+    await sendTelegram(
+      chatId,
+`🎁 <b>Please enter gift card code</b>
+
+Type code now:`
     );
   }
 
-  // Reject
+  // REJECT MENU
   else if (data.startsWith('reject_')) {
-    const wId = data.replace('reject_', '');
-    await rejectWithdrawal(chatId, wId);
+
+    const withdrawalId =
+      data.replace('reject_', '');
+
+    const keyboard = [
+
+      [{
+        text: '1️⃣ Server issue try again',
+        callback_data: `reason_${withdrawalId}_Server issue try again`
+      }],
+
+      [{
+        text: '2️⃣ Illegal token earning',
+        callback_data: `reason_${withdrawalId}_Illegal token earning detected`
+      }],
+
+      [{
+        text: '3️⃣ Wrong/Unsupported UPI',
+        callback_data: `reason_${withdrawalId}_Wrong or unsupported UPI ID`
+      }],
+
+      [{
+        text: '4️⃣ Suspicious activity',
+        callback_data: `reason_${withdrawalId}_Suspicious activity detected`
+      }],
+
+      [{
+        text: '5️⃣ Other ✍️',
+        callback_data: `reason_other_${withdrawalId}`
+      }]
+    ];
+
+    await sendTelegram(
+      chatId,
+      '❌ Select rejection reason',
+      keyboard
+    );
+  }
+
+  // CUSTOM REASON
+  else if (data.startsWith('reason_other_')) {
+
+    const withdrawalId =
+      data.replace('reason_other_', '');
+
+    waitingForInput[chatId] = {
+      type: 'custom_reject',
+      withdrawalId
+    };
+
+    await sendTelegram(
+      chatId,
+`✍️ <b>Type custom rejection reason</b>
+
+Example:
+Daily limit exceeded`
+    );
+  }
+
+  // FIXED REASON
+  else if (data.startsWith('reason_')) {
+
+    const parts = data.split('_');
+
+    const withdrawalId = parts[1];
+
+    const reason =
+      data.replace(`reason_${withdrawalId}_`, '');
+
+    await rejectWithdrawal(
+      chatId,
+      withdrawalId,
+      reason
+    );
   }
 }
 
 async function approveUPI(chatId, withdrawalId, txnId) {
-  try {
-    await sendTelegram(chatId, '⏳ Processing approval...');
 
-    const snap = await db.ref(`withdrawals/${withdrawalId}`).once('value');
+  try {
+
+    const snap =
+      await db.ref(`withdrawals/${withdrawalId}`)
+      .once('value');
 
     if (!snap.exists()) {
-      await sendTelegram(chatId, `❌ Withdrawal not found!\nID: ${withdrawalId}`);
+      await sendTelegram(chatId, '❌ Withdrawal not found');
       return;
     }
 
     const w = snap.val();
 
     if (w.status !== 'Pending') {
-      await sendTelegram(chatId, `⚠️ Already ${w.status}!`);
+      await sendTelegram(chatId, `⚠️ Already ${w.status}`);
       return;
     }
 
-    await db.ref(`withdrawals/${withdrawalId}`).update({
+    await db.ref(`withdrawals/${withdrawalId}`)
+    .update({
       status: 'Complete',
-      txnId: txnId,
+      txnId,
       completeTime: Date.now()
     });
 
-    await db.ref(`users/${w.userId}`).transaction(user => {
+    await db.ref(`users/${w.userId}`)
+    .transaction(user => {
+
       if (user) {
-        user.totalWithdrawn = (user.totalWithdrawn || 0) + (w.amount || 0);
+        user.totalWithdrawn =
+          (user.totalWithdrawn || 0)
+          + (w.amount || 0);
       }
+
       return user;
     });
 
-    await sendTelegram(chatId,
-      `✅ <b>Payment Approved!</b>\n\n` +
-      `👤 ${w.userName || 'User'}\n` +
-      `💰 ₹${w.amount}\n` +
-      `💳 UPI: ${w.upiId}\n` +
-      `🔖 TXN ID: ${txnId}\n\n` +
-      `User will see this in history ✅`
+    await sendTelegram(
+      chatId,
+`✅ <b>UPI Payment Approved</b>
+
+👤 ${escapeHtml(w.userName || 'User')}
+💰 ₹${w.amount}
+
+🔖 TXN ID:
+<code>${txnId}</code>`
     );
-  } catch(e) {
-    await sendTelegram(chatId, `❌ Error: ${e.message}`);
+
+  } catch (e) {
+
+    console.error(e);
+
+    await sendTelegram(
+      chatId,
+      `❌ Error: ${e.message}`
+    );
   }
 }
 
-async function sendGiftCode(chatId, withdrawalId, code) {
-  try {
-    await sendTelegram(chatId, '⏳ Sending gift code...');
+async function approveGift(chatId, withdrawalId, code) {
 
-    const snap = await db.ref(`withdrawals/${withdrawalId}`).once('value');
+  try {
+
+    const snap =
+      await db.ref(`withdrawals/${withdrawalId}`)
+      .once('value');
 
     if (!snap.exists()) {
-      await sendTelegram(chatId, `❌ Withdrawal not found!\nID: ${withdrawalId}`);
+      await sendTelegram(chatId, '❌ Withdrawal not found');
       return;
     }
 
     const w = snap.val();
 
     if (w.status !== 'Pending') {
-      await sendTelegram(chatId, `⚠️ Already ${w.status}!`);
+      await sendTelegram(chatId, `⚠️ Already ${w.status}`);
       return;
     }
 
-    await db.ref(`withdrawals/${withdrawalId}`).update({
+    await db.ref(`withdrawals/${withdrawalId}`)
+    .update({
       status: 'Complete',
       giftCode: code,
       completeTime: Date.now()
     });
 
-    await db.ref(`users/${w.userId}`).transaction(user => {
+    await db.ref(`users/${w.userId}`)
+    .transaction(user => {
+
       if (user) {
-        user.totalWithdrawn = (user.totalWithdrawn || 0) + (w.amount || 0);
+
+        user.totalWithdrawn =
+          (user.totalWithdrawn || 0)
+          + (w.amount || 0);
       }
+
       return user;
     });
 
-    await sendTelegram(chatId,
-      `✅ <b>Gift Code Sent!</b>\n\n` +
-      `👤 ${w.userName || 'User'}\n` +
-      `💰 ₹${w.amount}\n` +
-      `📋 Method: ${w.method}\n` +
-      `🎁 Code: <code>${code}</code>\n\n` +
-      `User will see code in history ✅`
+    await sendTelegram(
+      chatId,
+`✅ <b>Gift Code Sent</b>
+
+👤 ${escapeHtml(w.userName || 'User')}
+💰 ₹${w.amount}
+
+🎁 Code:
+<code>${escapeHtml(code)}</code>`
     );
-  } catch(e) {
-    await sendTelegram(chatId, `❌ Error: ${e.message}`);
+
+  } catch (e) {
+
+    console.error(e);
+
+    await sendTelegram(
+      chatId,
+      `❌ Error: ${e.message}`
+    );
   }
 }
 
-async function rejectWithdrawal(chatId, withdrawalId) {
-  try {
-    await sendTelegram(chatId, '⏳ Processing rejection...');
+async function rejectWithdrawal(chatId, withdrawalId, reason) {
 
-    const snap = await db.ref(`withdrawals/${withdrawalId}`).once('value');
+  try {
+
+    const snap =
+      await db.ref(`withdrawals/${withdrawalId}`)
+      .once('value');
 
     if (!snap.exists()) {
-      await sendTelegram(chatId, `❌ Not found!\nID: ${withdrawalId}`);
+      await sendTelegram(chatId, '❌ Withdrawal not found');
       return;
     }
 
     const w = snap.val();
 
     if (w.status !== 'Pending') {
-      await sendTelegram(chatId, `⚠️ Already ${w.status}!`);
+      await sendTelegram(chatId, `⚠️ Already ${w.status}`);
       return;
     }
 
-    const refund = w.amount === 20 ? 200 : w.amount === 50 ? 500 : 1000;
+    const refund =
+      w.tokensUsed ||
+      (w.amount === 20 ? 200 :
+      w.amount === 50 ? 500 : 1000);
 
-    await db.ref(`withdrawals/${withdrawalId}`).update({
+    await db.ref(`withdrawals/${withdrawalId}`)
+    .update({
       status: 'Rejected',
+      rejectionReason: reason,
+      refundedTokens: refund,
       completeTime: Date.now()
     });
 
-    await db.ref(`users/${w.userId}`).transaction(user => {
+    await db.ref(`users/${w.userId}`)
+    .transaction(user => {
+
       if (user) {
-        user.tokens = (user.tokens || 0) + refund;
+
+        user.tokens =
+          (user.tokens || 0)
+          + refund;
       }
+
       return user;
     });
 
-    await sendTelegram(chatId,
-      `❌ <b>Withdrawal Rejected!</b>\n\n` +
-      `👤 ${w.userName || 'User'}\n` +
-      `💰 ₹${w.amount} rejected\n` +
-      `🪙 ${refund} tokens refunded\n\n` +
-      `Tokens restored to user ✅`
+    await sendTelegram(
+      chatId,
+`❌ <b>Withdrawal Rejected</b>
+
+👤 ${escapeHtml(w.userName || 'User')}
+💰 ₹${w.amount}
+
+📌 Reason:
+${escapeHtml(reason)}
+
+🪙 Refunded:
+${refund} tokens`
     );
-  } catch(e) {
-    await sendTelegram(chatId, `❌ Error: ${e.message}`);
+
+  } catch (e) {
+
+    console.error(e);
+
+    await sendTelegram(
+      chatId,
+      `❌ Error: ${e.message}`
+    );
   }
 }
 
 app.post('/notify-withdrawal', async (req, res) => {
+
   try {
-    const { userName, amount, method, upiId, withdrawalId } = req.body;
 
-    const isUPI = method === 'UPI';
-    const isGift = method === 'Amazon' || method === 'Playstore';
-
-    const msg =
-      `🔔 <b>NEW WITHDRAWAL REQUEST!</b>\n\n` +
-      `👤 ${userName || 'User'}\n` +
-      `💰 ₹${amount}\n` +
-      `📋 ${method}\n` +
-      `💳 ${isUPI ? upiId : 'Gift Card'}\n` +
-      `🆔 <code>${withdrawalId}</code>`;
+    const {
+      userName,
+      amount,
+      method,
+      upiId,
+      withdrawalId
+    } = req.body;
 
     const keyboard = [];
 
-    if (isUPI) {
+    // UPI
+    if (method === 'UPI') {
+
       keyboard.push([{
-        text: '✅ Approve UPI Payment',
+        text: '✅ Approve UPI',
         callback_data: `approve_upi_${withdrawalId}`
       }]);
     }
 
-    if (isGift) {
+    // AMAZON
+    else if (method === 'Amazon') {
+
       keyboard.push([{
-        text: '🎁 Send Gift Card Code',
+        text: '🎁 Send Amazon Code',
+        callback_data: `approve_gift_${withdrawalId}`
+      }]);
+    }
+
+    // PLAYSTORE
+    else if (method === 'Playstore') {
+
+      keyboard.push([{
+        text: '🎮 Send Playstore Code',
         callback_data: `approve_gift_${withdrawalId}`
       }]);
     }
@@ -471,15 +742,41 @@ app.post('/notify-withdrawal', async (req, res) => {
       callback_data: `reject_${withdrawalId}`
     }]);
 
-    await sendTelegram(ADMIN_CHAT_ID, msg, keyboard);
+    const msg =
+`🔔 <b>NEW WITHDRAWAL REQUEST</b>
+
+👤 ${escapeHtml(userName || 'User')}
+💰 ₹${amount}
+📋 ${escapeHtml(method)}
+
+💳 ${method === 'UPI'
+? escapeHtml(upiId || '')
+: 'Gift Card'}
+
+🆔
+<code>${withdrawalId}</code>`;
+
+    await sendTelegram(
+      ADMIN_CHAT_ID,
+      msg,
+      keyboard
+    );
+
     res.json({ ok: true });
-  } catch(e) {
-    console.error('Notify error:', e);
-    res.json({ ok: false });
+
+  } catch (e) {
+
+    console.error(e);
+
+    res.json({
+      ok: false,
+      error: e.message
+    });
   }
 });
 
 app.get('/', (req, res) => {
+
   res.json({
     status: '✅ VCEarn Bot Running',
     time: new Date().toISOString()
@@ -487,6 +784,7 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`Server running: ${PORT}`);
+  console.log(`Server running on ${PORT}`);
 });
